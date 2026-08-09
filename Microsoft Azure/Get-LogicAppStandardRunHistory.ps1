@@ -76,13 +76,27 @@
     Filter to only retrieve specific action names. Accepts an array of action names.
     When specified, only these actions will be included in the results.
     Automatically enables -IncludeActionDetails.
+    Names can be specified with spaces (as shown in the Azure Portal GUI) or with
+    underscores (as used in the backend). Spaces are automatically converted to underscores.
+
+.PARAMETER RequireSucceededActions
+    Only include runs where the specified action(s) exist AND succeeded.
+    Accepts an array of action names. Runs where any of these actions are missing
+    or did not succeed will be excluded from the output.
+    Names can be specified with spaces (as shown in the Azure Portal GUI) or with
+    underscores (as used in the backend). Spaces are automatically converted to underscores.
+    Automatically enables -IncludeActionDetails.
 
 .PARAMETER ListWorkflows
     Lists all workflows in the Logic App Standard without retrieving run history.
 
 .PARAMETER NonInteractive
-    Run in non-interactive mode. When multiple workflows are available and no WorkflowName 
+    Run in non-interactive mode. When multiple workflows are available and no WorkflowName
     is specified, the script will fail instead of prompting for selection.
+
+.PARAMETER UseUtc
+    Interpret StartTime and EndTime parameters as UTC and display all output times in UTC.
+    When not specified, times are interpreted and displayed in local time.
 
 .EXAMPLE
     .\Get-LogicAppStandardRunHistory.ps1 -ResourceGroupName "MyRG" -LogicAppStandardName "MyLogicAppStandard" -ListWorkflows
@@ -109,9 +123,10 @@
     Returns an array of custom objects with run history details.
 
 .NOTES
-    Version:        2.0.0
-    Author:         Daniel Streefkerk (Original) - Modified for Standard Logic Apps
-    Creation Date:  06 August 2025 (Original) - Modified September 2025
+    Version:        2.0.1
+    Author:         Daniel Streefkerk
+    Creation Date:  06 August 2025
+    Last Modified:  14 January 2026
     Purpose:        Azure Logic App Standard workflow run history extraction
     
     Prerequisites:
@@ -200,10 +215,16 @@ param(
     [string[]]$ActionNames,
 
     [Parameter()]
+    [string[]]$RequireSucceededActions,
+
+    [Parameter()]
     [switch]$ListWorkflows,
 
     [Parameter()]
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+
+    [Parameter()]
+    [switch]$UseUtc
 )
 
 #region Functions
@@ -327,30 +348,50 @@ function Get-WorkflowRuns {
         
         [Parameter()]
         [DateTime]$StartTime,
-        
+
+        [Parameter()]
+        [DateTime]$EndTime,
+
+        [Parameter()]
+        [switch]$UseUtc,
+
         [Parameter()]
         [uint32]$MaxResults = 1000
     )
-    
+
     try {
         # Build the runs endpoint for Standard Logic Apps
         # Using the hostruntime API endpoint
         $runsUri = "$BaseUri/hostruntime/runtime/webhooks/workflow/api/management/workflows/$WorkflowName/runs?api-version=2018-11-01&`$top=50"
-        
-        # Add filter for status if specified
+
+        # Build OData filter components
+        $filterParts = @()
+
         if ($Status) {
-            $runsUri += "&`$filter=status eq '$Status'"
+            $filterParts += "status eq '$Status'"
         }
-        
-        # Add date filter
+
         if ($StartTime) {
-            $startTimeUtc = $StartTime.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
-            if ($Status) {
-                $runsUri += " and startTime ge $startTimeUtc"
+            # If UseUtc, times are already UTC; otherwise convert from local
+            $startTimeUtc = if ($UseUtc) {
+                $StartTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+            } else {
+                $StartTime.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
             }
-            else {
-                $runsUri += "&`$filter=startTime ge $startTimeUtc"
+            $filterParts += "startTime ge $startTimeUtc"
+        }
+
+        if ($EndTime) {
+            $endTimeUtc = if ($UseUtc) {
+                $EndTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+            } else {
+                $EndTime.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
             }
+            $filterParts += "startTime le $endTimeUtc"
+        }
+
+        if ($filterParts.Count -gt 0) {
+            $runsUri += "&`$filter=" + ($filterParts -join ' and ')
         }
         
         Write-Verbose "Fetching runs from: $runsUri"
@@ -403,19 +444,19 @@ function Get-RunActions {
     param(
         [Parameter(Mandatory = $true)]
         [string]$WorkflowName,
-        
+
         [Parameter(Mandatory = $true)]
         [string]$RunId,
-        
+
         [Parameter(Mandatory = $true)]
         [hashtable]$Headers,
-        
+
         [Parameter(Mandatory = $true)]
         [string]$BaseUri,
-        
+
         [Parameter()]
         [switch]$IncludeInputsOutputs,
-        
+
         [Parameter()]
         [string[]]$ActionNames
     )
@@ -424,15 +465,35 @@ function Get-RunActions {
         # Actions endpoint for Standard Logic Apps
         $actionsUri = "$BaseUri/hostruntime/runtime/webhooks/workflow/api/management/workflows/$WorkflowName/runs/$RunId/actions?api-version=2018-11-01"
         Write-Verbose "Fetching actions for run: $RunId"
-        
-        $response = Invoke-RestMethod -Uri $actionsUri -Headers $Headers -Method Get -ErrorAction Stop
-        
-        if (-not $response.value) {
+
+        # Fetch all pages of actions (API paginates at ~30 actions)
+        $allActionData = @()
+        $nextLink = $actionsUri
+        $pageCount = 0
+
+        while ($nextLink) {
+            $pageCount++
+            $response = Invoke-RestMethod -Uri $nextLink -Headers $Headers -Method Get -ErrorAction Stop
+
+            if ($response.value) {
+                $allActionData += $response.value
+            }
+
+            # Check for next page
+            $nextLink = if ($response.PSObject.Properties['nextLink']) { $response.nextLink } else { $null }
+            if ($nextLink) {
+                Write-Verbose "Fetching actions page $($pageCount + 1) for run: $RunId"
+            }
+        }
+
+        if ($allActionData.Count -eq 0) {
             return @()
         }
-        
-        # Use efficient foreach output capture pattern
-        $actions = foreach ($action in $response.value) {
+
+        Write-Verbose "Retrieved $($allActionData.Count) total actions across $pageCount page(s)"
+
+        # Use efficient foreach output capture pattern, wrapped in @() to ensure array even when empty
+        $actions = @(foreach ($action in $allActionData) {
             # Filter by action name if specified
             if ($ActionNames -and $action.name -notin $ActionNames) {
                 Write-Verbose "Skipping action '$($action.name)' - not in filter list"
@@ -462,7 +523,7 @@ function Get-RunActions {
                 # Get the direct inputs/outputs first
                 $inputs = Get-SafeProperty -Object $action -PropertyPath 'properties.inputs'
                 $outputs = Get-SafeProperty -Object $action -PropertyPath 'properties.outputs'
-                
+
                 # Check for content links and override if they exist
                 $inputsLinkUri = Get-SafeProperty -Object $action -PropertyPath 'properties.inputsLink.uri'
                 if ($inputsLinkUri) {
@@ -475,7 +536,7 @@ function Get-RunActions {
                         Write-Verbose "Could not fetch input content: $_"
                     }
                 }
-                
+
                 $outputsLinkUri = Get-SafeProperty -Object $action -PropertyPath 'properties.outputsLink.uri'
                 if ($outputsLinkUri) {
                     try {
@@ -487,7 +548,7 @@ function Get-RunActions {
                         Write-Verbose "Could not fetch output content: $_"
                     }
                 }
-                
+
                 # Add the inputs/outputs to the action object
                 $actionObject | Add-Member -NotePropertyName Inputs -NotePropertyValue $inputs
                 $actionObject | Add-Member -NotePropertyName Outputs -NotePropertyValue $outputs
@@ -495,10 +556,10 @@ function Get-RunActions {
             
             # Output the action object
             $actionObject
-        }
-        
+        })
+
         if ($ActionNames) {
-            Write-Verbose "Filtered to $($actions.Count) actions matching: $($ActionNames -join ', ')"
+            Write-Verbose "Found $($actions.Count) of $($ActionNames.Count) requested actions: $($ActionNames -join ', ')"
         }
         
         return $actions
@@ -530,7 +591,7 @@ function Get-TriggerHistory {
     
     try {
         # Trigger history endpoint for Standard Logic Apps
-        $triggerHistoryUri = "$BaseUri/hostruntime/runtime/webhooks/workflow/api/management/workflows/$WorkflowName/triggers/$TriggerName/histories/$RunId?api-version=2018-11-01"
+        $triggerHistoryUri = "$BaseUri/hostruntime/runtime/webhooks/workflow/api/management/workflows/$WorkflowName/triggers/$TriggerName/histories/${RunId}?api-version=2018-11-01"
         Write-Verbose "Fetching trigger history for run: $RunId"
         
         $response = Invoke-RestMethod -Uri $triggerHistoryUri -Headers $Headers -Method Get -ErrorAction Stop
@@ -690,12 +751,22 @@ try {
         $MaxResults = 1
         Write-Verbose "MostRecent specified - limiting to 1 result"
     }
+
+    # Normalize action names: convert spaces to underscores (GUI format to backend format)
+    if ($ActionNames) {
+        $ActionNames = $ActionNames | ForEach-Object { $_ -replace ' ', '_' }
+        Write-Verbose "Normalized ActionNames filter: $($ActionNames -join ', ')"
+    }
+    if ($RequireSucceededActions) {
+        $RequireSucceededActions = $RequireSucceededActions | ForEach-Object { $_ -replace ' ', '_' }
+        Write-Verbose "Normalized RequireSucceededActions filter: $($RequireSucceededActions -join ', ')"
+    }
     
     # Retrieve runs
     Write-Information "Retrieving runs for workflow: $WorkflowName" -InformationAction Continue
     
     if ($PSCmdlet.ShouldProcess("Azure Management API", "Query Logic App Standard workflow runs")) {
-        $allRuns = Get-WorkflowRuns -WorkflowName $WorkflowName -Headers $headers -BaseUri $baseUri -Status $Status -StartTime $StartTime -MaxResults $MaxResults
+        $allRuns = Get-WorkflowRuns -WorkflowName $WorkflowName -Headers $headers -BaseUri $baseUri -Status $Status -StartTime $StartTime -EndTime $EndTime -UseUtc:$UseUtc -MaxResults $MaxResults
         
         Write-Information "Retrieved $($allRuns.Count) runs" -InformationAction Continue
         
@@ -708,50 +779,101 @@ try {
             return @()
         }
         
-        # Process runs into objects using efficient foreach pattern
+        # Process runs into objects using efficient foreach pattern, wrapped in @() to ensure array even when empty
         Write-Verbose "Processing run data"
-        $processedRuns = foreach ($run in $allRuns) {
-            # Filter by EndTime if specified (API doesn't support this)
+        $processedRuns = @(foreach ($run in $allRuns) {
+            # Secondary EndTime filter (API also filters, but this ensures edge cases are handled)
             if ($EndTime) {
-                $runStartTime = if ($run.properties.startTime) { 
-                    try { [DateTime]$run.properties.startTime } catch { $null }
+                $runStartTime = if ($run.properties.startTime) {
+                    try {
+                        $parsed = [DateTime]$run.properties.startTime
+                        if ($UseUtc) { $parsed } else { $parsed.ToLocalTime() }
+                    } catch { $null }
                 } else { $null }
-                
+
                 if ($runStartTime -and $runStartTime -gt $EndTime) {
                     continue
                 }
             }
-            
+
             # Create output object
-            $startTime = Get-SafeProperty -Object $run -PropertyPath 'properties.startTime'
-            $endTime = Get-SafeProperty -Object $run -PropertyPath 'properties.endTime'
-            
+            $runStartTimeRaw = Get-SafeProperty -Object $run -PropertyPath 'properties.startTime'
+            $runEndTimeRaw = Get-SafeProperty -Object $run -PropertyPath 'properties.endTime'
+
             # Calculate duration if both times exist
-            $duration = if ($startTime -and $endTime) {
-                try { ([DateTime]$endTime - [DateTime]$startTime).TotalSeconds } catch { $null }
+            $duration = if ($runStartTimeRaw -and $runEndTimeRaw) {
+                try { ([DateTime]$runEndTimeRaw - [DateTime]$runStartTimeRaw).TotalSeconds } catch { $null }
             } else { $null }
-            
+
+            # Convert times to local unless UseUtc is specified
+            $displayStartTime = if ($runStartTimeRaw) {
+                $parsed = [DateTime]$runStartTimeRaw
+                if ($UseUtc) { $parsed } else { $parsed.ToLocalTime() }
+            } else { $null }
+
+            $displayEndTime = if ($runEndTimeRaw) {
+                $parsed = [DateTime]$runEndTimeRaw
+                if ($UseUtc) { $parsed } else { $parsed.ToLocalTime() }
+            } else { $null }
+
             $runObject = [PSCustomObject]@{
                 RunId        = $run.name
                 WorkflowName = $WorkflowName
                 Status       = Get-SafeProperty -Object $run -PropertyPath 'properties.status'
-                StartTime    = $startTime ? [DateTime]$startTime : $null
-                EndTime      = $endTime ? [DateTime]$endTime : $null
+                StartTime    = $displayStartTime
+                EndTime      = $displayEndTime
                 Duration     = $duration
                 TriggerName  = Get-SafeProperty -Object $run -PropertyPath 'properties.trigger.name'
-                TriggerTime  = if ($triggerTime = Get-SafeProperty -Object $run -PropertyPath 'properties.trigger.startTime') { 
-                    try { [DateTime]$triggerTime } catch { $null } 
+                TriggerTime  = if ($triggerTime = Get-SafeProperty -Object $run -PropertyPath 'properties.trigger.startTime') {
+                    try {
+                        $parsed = [DateTime]$triggerTime
+                        if ($UseUtc) { $parsed } else { $parsed.ToLocalTime() }
+                    } catch { $null }
                 } else { $null }
                 ErrorCode    = Get-SafeProperty -Object $run -PropertyPath 'properties.error.code'
                 ErrorMessage = Get-SafeProperty -Object $run -PropertyPath 'properties.error.message'
                 Correlation  = Get-SafeProperty -Object $run -PropertyPath 'properties.correlation'
             }
             
-            # Get action details if requested or if specific actions are requested
-            if ($IncludeActionDetails -or $ActionNames) {
+            # Get action details if requested, specific actions requested, or need to check required succeeded actions
+            if ($IncludeActionDetails -or $ActionNames -or $RequireSucceededActions) {
                 Write-Verbose "Fetching action details for run: $($run.name)"
-                $actions = Get-RunActions -WorkflowName $WorkflowName -RunId $run.name -Headers $headers -BaseUri $baseUri -IncludeInputsOutputs:$IncludeInputsOutputs -ActionNames $ActionNames
-                
+
+                # Calculate which actions to fetch - union of ActionNames and RequireSucceededActions (only fetch what we need)
+                $actionNamesToFetch = if ($ActionNames -or $RequireSucceededActions) {
+                    @(($ActionNames + $RequireSucceededActions) | Where-Object { $_ } | Select-Object -Unique)
+                } else {
+                    $null  # Fetch all if just -IncludeActionDetails
+                }
+
+                $allActions = Get-RunActions -WorkflowName $WorkflowName -RunId $run.name -Headers $headers -BaseUri $baseUri -IncludeInputsOutputs:$IncludeInputsOutputs -ActionNames $actionNamesToFetch
+
+                # Check RequireSucceededActions filter - skip run if required actions don't exist or didn't succeed
+                if ($RequireSucceededActions) {
+                    $missingOrFailed = @()
+                    foreach ($requiredAction in $RequireSucceededActions) {
+                        $matchedAction = $allActions | Where-Object { $_.Name -eq $requiredAction }
+                        if (-not $matchedAction) {
+                            $missingOrFailed += "$requiredAction (missing)"
+                        }
+                        elseif ($matchedAction.Status -ne 'Succeeded') {
+                            $missingOrFailed += "$requiredAction (status: $($matchedAction.Status))"
+                        }
+                    }
+
+                    if ($missingOrFailed.Count -gt 0) {
+                        Write-Verbose "Skipping run $($run.name) - required actions not succeeded: $($missingOrFailed -join ', ')"
+                        continue
+                    }
+                }
+
+                # Apply ActionNames filter for display if specified
+                $actions = if ($ActionNames) {
+                    @($allActions | Where-Object { $_.Name -in $ActionNames })
+                } else {
+                    $allActions
+                }
+
                 if ($actions) {
                     $runObject | Add-Member -NotePropertyName Actions -NotePropertyValue $actions
                     $runObject | Add-Member -NotePropertyName ActionCount -NotePropertyValue $actions.Count
@@ -796,8 +918,8 @@ try {
             
             # Output the run object
             $runObject
-        }
-        
+        })
+
         Write-Information "Processed $($processedRuns.Count) runs" -InformationAction Continue
         
         # Generate summary
